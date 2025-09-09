@@ -5,23 +5,26 @@ import time
 import pandas as pd
 import Levenshtein
 import httpx
+import tiktoken
 from concurrent.futures import ThreadPoolExecutor
 
 
 top_p = 0.95
 top_k = 40
-temperature = 0.2
+temperature = 0.1
 limit_items = 2000
 openai_api_base_url = 'http://litellm-litellm-1:4000/v1/'
-model = 'Qwen/Qwen2.5-Coder-1.5B'
 n_cores = 8
 max_tokens = 50
+max_prompt_tokens = None
+
 
 def main(args: list[str]):
     st_time = time.time()
     try:
         dataset_name = args[0]
         dataset_path = args[1]
+        model = args[2]
     except Exception:
         print_usage()
         exit(0)
@@ -33,13 +36,13 @@ def main(args: list[str]):
 
     python_dat = os.path.join(dataset_path, 'python.jsonl')
     dataset = load_dataset(python_dat) 
-    report_python = benchmark(client, dataset[:limit_items], config)
+    report_python = benchmark(client, dataset[:limit_items], config, model)
     export_report(report_python, dataset_name, 'python')
     print_summary_report(report_python, dataset_name, 'python')
 
     java_dat = os.path.join(dataset_path, 'java.jsonl') 
     dataset = load_dataset(java_dat) 
-    report_java = benchmark(client, dataset[:limit_items], config)
+    report_java = benchmark(client, dataset[:limit_items], config, model)
     export_report(report_java, dataset_name, 'java')
     print_summary_report(report_java, dataset_name, 'java')
 
@@ -65,13 +68,13 @@ def load_dataset(filename: str):
                 dataset.append(item)
     return dataset
 
-def process_row(prompt, expected, client, config):
+
+def process_row(model, prompt, expected, client, config):
+    prompt = prepare_prompt(prompt, max_prompt_tokens)
+
     payload = dict(
         model=model,
-        messages=[{
-            "role": "user",
-            "content": prompt,
-        }],
+        prompt=prompt,
         stop=config.get('stop_token', ['\n']),
         top_k=top_k,
         top_p=top_p,
@@ -80,27 +83,25 @@ def process_row(prompt, expected, client, config):
     )
 
     try:
-        res = client.post(url='/chat/completions', json=payload, timeout=60*5)
+        st_time = time.time()
+        res = client.post(url='/completions', json=payload, timeout=60*5)
+        f_time = time.time()
         data = res.json()
-        time_to_process = (float(res.headers['x-litellm-response-duration-ms']) - float(res.headers['x-litellm-overhead-duration-ms'])) / 1000
-        prompt_tokens = data['usage']['prompt_tokens']
-        completion_tokens = data['usage']['completion_tokens']
     except Exception as e:
         print(e)
         return None
 
     return dict(
         prompt=prompt,
-        actual=data['choices'][0]['message']['content'], #type:ignore for litellm
+        actual=data['choices'][0]['text'], #type:ignore for litellm
         expected=expected,
         es_score=0,
         em_score=0,
-        time_to_process=time_to_process,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
+        total_tokens=data['usage']['total_tokens'],
+        elap_time=f_time - st_time,
     )
 
-def benchmark(client: httpx.Client, dataset: list, config: dict) -> pd.DataFrame:
+def benchmark(client: httpx.Client, dataset: list, config: dict, model) -> pd.DataFrame:
     report_data = []
     fs = []
     with ThreadPoolExecutor(max_workers=n_cores) as pool:
@@ -110,14 +111,17 @@ def benchmark(client: httpx.Client, dataset: list, config: dict) -> pd.DataFrame
             if not (prompt and expected):
                 continue
 
-            future = pool.submit(process_row, prompt, expected, client, config)
+            future = pool.submit(process_row, model, prompt, expected, client, config)
             fs.append(future)
         pool.shutdown(wait=True)
 
     for f in fs:
+        result = f.result()
+        if result is None:
+            continue
         add_to_report(
             report_data,
-            **f.result(),
+            **result,
         )
 
     report = pd.DataFrame(data=report_data)
@@ -136,7 +140,7 @@ def add_to_report(report_data: list, **kwargs):
 def calculate_score(row):
     row['es_score'] = Levenshtein.ratio(row['expected'], row['actual'])
     row['em_score'] = int(row['expected'] == row['actual'])
-    row['tps'] = (row['completion_tokens'] + row['prompt_tokens']) / row['time_to_process']
+    row['tps'] = row['total_tokens'] / row['elap_time']
     return row
 
 
@@ -178,6 +182,42 @@ Arguments:
 Ví dụ:
     python main.py qwencoder ./datasets/humaneval
 """)
+
+
+def token_enc(text: str) -> list[int]:
+    enc = tiktoken.encoding_for_model('gpt-4o')
+    tokens = enc.encode(text)
+    return tokens
+
+
+def parse_fim(text: str):
+    i_prefix = text.find('<|fim_prefix|>')
+    i_suffix = text.find('<|fim_suffix|>') 
+    i_middle = text.find('<|fim_middle|>')
+    prefix = text[i_prefix+14:i_suffix]
+    suffix = text[i_suffix+14:i_middle]
+    return prefix, suffix
+
+
+def prepare_prompt(text: str, max_prompt_tokens=None) -> str:
+    if max_prompt_tokens is None:
+        return text
+
+    prefix, suffix = parse_fim(text)
+    while len(token_enc(prefix)) > max_prompt_tokens:
+        i = prefix.find('\n')
+        if i <= 0:
+            break
+        prefix = prefix[i:]
+
+    while (len(token_enc(suffix))) > max_prompt_tokens:
+        i = suffix.rfind('\n')
+        if i <= 0:
+            break
+        suffix = suffix[:i]
+
+    prompt = f'<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>'
+    return prompt
 
 
 if __name__ == '__main__':
