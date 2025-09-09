@@ -3,17 +3,20 @@ import sys
 import json
 import pandas as pd
 import Levenshtein
-import httpx
+from llama_cpp import Llama, llama_perf_context
+from huggingface_hub import hf_hub_download
 
 
-repo_id = "unsloth/Qwen2.5-Coder-3B-Instruct-GGUF"
-model_filename = "Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf"
+# repo_id = "unsloth/Qwen2.5-Coder-3B-Instruct-GGUF"
+# model_filename = "Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf"
+repo_id = "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"
+model_filename = "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
 top_p = 0.95
 top_k = 40
 temperature = 0.2
 n_ctx = 0
 limit_items = 50
-openai_api_base_url = 'http://localhost:8000/v1'
+verbose = False
 
 
 def main(args: list[str]):
@@ -24,19 +27,35 @@ def main(args: list[str]):
         print_usage()
         exit(0)
 
-    client = httpx.Client(base_url=openai_api_base_url)
+    model = load_model(
+        repo_id=repo_id,
+        filename=model_filename,
+    )
 
     python_dat = os.path.join(dataset_path, 'python.jsonl')
     dataset = load_dataset(python_dat) 
-    report_python = benchmark(client, dataset[:limit_items])
+    report_python = benchmark(model, dataset[:limit_items])
     export_report(report_python, dataset_name, 'python')
     print_summary_report(report_python, dataset_name, 'python')
 
     java_dat = os.path.join(dataset_path, 'java.jsonl') 
     dataset = load_dataset(java_dat) 
-    report_java = benchmark(client, dataset[:limit_items])
+    report_java = benchmark(model, dataset[:limit_items])
     export_report(report_java, dataset_name, 'java')
     print_summary_report(report_java, dataset_name, 'java')
+
+
+def load_model(repo_id: str, filename: str) -> Llama:
+    model_path = hf_hub_download(repo_id=repo_id, filename=filename)
+    print(model_path)
+
+    model = Llama(
+        model_path=model_path,
+        n_ctx=n_ctx,
+        verbose=verbose,
+        n_gpu_layers=-1,
+    )
+    return model
 
 
 def load_dataset(filename: str):
@@ -52,15 +71,15 @@ def load_dataset(filename: str):
     return dataset
 
 
-def benchmark(client: httpx.Client, dataset: list) -> pd.DataFrame:
+def benchmark(model: Llama, dataset: list) -> pd.DataFrame:
     report_data = []
     for item in dataset:
         prompt = item.get('prompt')
         expected = item.get('groundtruth')
         if not (prompt and expected):
             continue
-
-        payload = dict(
+        
+        res = model.create_completion(
             prompt=prompt,
             stop=['\n'],
             echo=False,
@@ -68,13 +87,11 @@ def benchmark(client: httpx.Client, dataset: list) -> pd.DataFrame:
             top_p=top_p,
             temperature=temperature,
         )
-        
-        res = client.post(url='/completions', json=payload, timeout=60*5)
-        data = res.json()
         add_to_report(
+            perf_ctx=llama_perf_context(model.ctx), 
             report_data=report_data,
             prompt=prompt,
-            actual=data['choices'][0]['text'], #type:ignore
+            actual=res['choices'][0]['text'], #type:ignore
             expected=expected,
             es_score=0,
             em_score=0,
@@ -85,10 +102,18 @@ def benchmark(client: httpx.Client, dataset: list) -> pd.DataFrame:
     return report #type:ignore
 
 
-def add_to_report(report_data: list, **kwargs):
+def add_to_report(perf_ctx, report_data: list, **kwargs):
     r = {
+        "load_time": perf_ctx.t_load_ms,
+        "time_prompt_eval": perf_ctx.t_p_eval_ms,
+        "time_eval": perf_ctx.t_eval_ms,
+        "prompt_tokens": perf_ctx.n_p_eval,
+        "eval_tokens": perf_ctx.n_eval,
+        "reused_tokens": perf_ctx.n_reused,
         **kwargs,
     }
+    r['prompt_tokens_per_second'] = r['prompt_tokens'] / r['time_prompt_eval'] * 1000 
+    r['eval_tokens_per_second'] = r['eval_tokens'] / r['time_eval'] * 1000
     report_data.append(r)
 
 
@@ -116,6 +141,9 @@ def print_summary_report(report: pd.DataFrame, dataset_name: str, lang: str):
 
     em_score = report['em_score'].mean()
     print(f'Mean of Exact math: {em_score}')
+
+    tps = (((report["prompt_tokens"] + report["eval_tokens"]) / (report["time_eval"] + report["time_prompt_eval"])).mean()) * 1000
+    print(f'Tokens per Second: {tps}')
 
 
 def print_usage():
